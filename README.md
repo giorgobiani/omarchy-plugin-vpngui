@@ -254,12 +254,14 @@ file is imported with `nmcli connection import type openvpn`, which copies
 its certificates to `~/.local/share/networkmanagement/certificates/`.
 
 **OpenVPN with browser SSO** uses OpenVPN 3. The `.ovpn` is imported with
-`openvpn3 config-import --persistent`. `openvpn3 session-start` announces web
-authentication to the server (`IV_SSO=webauth`), answers any
-username / password prompts through the panel, and opens the server's
-sign-in URL in the default browser. The helper reads that URL from `openvpn3
-session-auth` (for the **Open sign-in page** button) and follows the session
-over D-Bus (`net.openvpn.v3.sessions`) until it is connected.
+`openvpn3 config-import --persistent`. `openvpn3 session-start --background`
+announces web authentication to the server (`IV_SSO=webauth`), passes any
+username / password prompts to the panel, and returns once the session is
+running. The helper then follows the session over D-Bus
+(`net.openvpn.v3.sessions`): it reads the sign-in URL from `openvpn3
+session-auth`, opens it once in the default browser (a browser that is already
+signed in finishes it by itself), and is done when the session reports
+connected.
 
 ## Storage and security
 

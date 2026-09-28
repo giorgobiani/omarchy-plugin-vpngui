@@ -202,6 +202,8 @@ def openvpn_remote(remote):
 # unprivileged over D-Bus and announces IV_SSO=webauth to the server.
 
 OVPN3_CONNECTED = 7   # StatusMinor CONN_CONNECTED on net.openvpn.v3.sessions
+# Other StatusMinor values worth telling the user about while waiting.
+OVPN3_PROGRESS = {5: "Connecting to server…", 6: "Connecting to server…", 12: "Reconnecting…"}
 
 
 def ovpn3_id(config_path):
@@ -926,7 +928,7 @@ class PtyLogin:
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
                         self.line(line.strip())
-                elif buf.strip() and proc.poll() is None:
+                elif re.search(r"[:?]\s*$", buf) and proc.poll() is None:
                     label, buf = buf.strip(), ""
                     answer = self.on_prompt(label, master)
                     if answer is None:
@@ -1052,10 +1054,14 @@ class NMOpenVPNLogin(PtyLogin):
 
 
 class Ovpn3Login(PtyLogin):
-    """OpenVPN 3 session with web authentication (SAML / SSO). session-start
-    handles username / password / challenge prompts itself, then leaves the
-    session waiting for the browser sign-in; the URL is read from
-    `openvpn3 session-auth` and opened in the default browser."""
+    """OpenVPN 3 session with web authentication (SAML / SSO).
+
+    `session-start --background` asks for any username / password / challenge
+    and returns as soon as the session runs. The session is then followed over
+    D-Bus: the sign-in URL (from `openvpn3 session-auth`) is opened once in the
+    default browser, and the login is done when the session reports connected.
+    Without --background, session-start opens the browser itself and may keep
+    running while the session connects, which left the login waiting on it."""
 
     def __init__(self, uuid):
         super().__init__(uuid)
@@ -1067,10 +1073,9 @@ class Ovpn3Login(PtyLogin):
         if m:
             self.session_path = m.group(1)
             return
-        # session-start opens the sign-in page in the default browser by itself
-        # (g_app_info_launch_default_for_uri); the browser's own chatter lands here too.
         if text.startswith(("Web based authentication required", "Session running, awaiting",
-                            "Further manage this session", "Connected", "Opening in existing browser")):
+                            "Session is running in the background", "Further manage this session",
+                            "Connected")):
             return
         self.messages.append(text)
         emit("log", text=text)
@@ -1102,15 +1107,22 @@ class Ovpn3Login(PtyLogin):
         if existing and existing[1] == OVPN3_CONNECTED:
             return self.succeeded()
         if existing:
-            ovpn3_run("session-manage", "--path", existing[0], "--disconnect")   # stale, half-open
+            # A stale, half-open session: make sure it is gone before starting
+            # again, or the server may still be busy with its sign-in.
+            ovpn3_run("session-manage", "--path", existing[0], "--disconnect")
+            for _ in range(20):
+                if self.path not in ovpn3_sessions():
+                    break
+                time.sleep(0.5)
         emit("state", state="authenticating")
-        rc = self.run_pty(["openvpn3", "session-start", "--config-path", self.path])
+        rc = self.run_pty(["openvpn3", "session-start", "--background", "--config-path", self.path])
         if rc is None:
             return False
         if not self.session_path:
             emit("error", text=self.messages[-1] if self.messages else "OpenVPN 3 could not start a session")
             return False
         announced = ""
+        progress = ""
         deadline = time.time() + SSO_TIMEOUT
         while time.time() < deadline:
             session = ovpn3_sessions().get(self.path)
@@ -1119,11 +1131,18 @@ class Ovpn3Login(PtyLogin):
                 return False
             if session[1] == OVPN3_CONNECTED:
                 return self.succeeded()
+            text = OVPN3_PROGRESS.get(session[1], "")
+            if text and text != progress and not announced:
+                progress = text
+                emit("log", text=text)
             url = self.auth_url()
             if url and url != announced:
-                # The panel offers to open it again in case no browser came up.
+                # Opened once; the panel's "Open sign-in page" opens it again.
+                # A browser that is already signed in completes it by itself.
                 announced = url
                 emit("state", state="browser", url=url)
+                subprocess.Popen(["xdg-open", url], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
             time.sleep(1)
         self.abort()
         emit("error", text="Timed out waiting for the browser sign-in")
