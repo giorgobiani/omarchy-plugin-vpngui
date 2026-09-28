@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "shota.openconnect",
   "name": "VPN",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "shota",
   "license": "MIT",
   "description": "Connect to Cisco AnyConnect, GlobalProtect, FortiGate and other OpenConnect VPNs, and OpenVPN (username / password, certificates, OTP codes, and browser SSO / SAML), from the bar.",

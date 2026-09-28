@@ -5,7 +5,7 @@
                               and OpenVPN connections, plus OpenVPN 3 (SSO) profiles
   helper.py connect <id>      Interactive login; JSON events on stdout,
                               JSON answers on stdin ({"answer": "..."} / {"cancel": true})
-  helper.py disconnect <id>
+  helper.py disconnect <id>...  One or more profiles
   helper.py save              Create / update a profile from JSON on stdin
   helper.py delete <id>
   helper.py pick-file         Native file dialog for an .ovpn file; JSON {"path": ...}
@@ -281,17 +281,23 @@ def nm_service(uuid):
     return nmcli("-g", "vpn.service-type", "connection", "show", uuid).stdout.strip()
 
 
-def cmd_disconnect(uuid):
+def disconnect_one(uuid):
+    """Returns an error message, or "" on success."""
     if is_ovpn3(uuid):
         session = ovpn3_sessions().get(ovpn3_path(uuid))
         if not session:
-            sys.exit(0)
+            return ""
         res = ovpn3_run("session-manage", "--path", session[0], "--disconnect")
     else:
         res = nmcli("connection", "down", uuid)
-    if res.returncode != 0:
-        sys.stderr.write(res.stderr or res.stdout)
-    sys.exit(res.returncode)
+    return "" if res.returncode == 0 else (res.stderr or res.stdout).strip()
+
+
+def cmd_disconnect(uuids):
+    errors = [e for e in (disconnect_one(u) for u in uuids) if e]
+    if errors:
+        sys.stderr.write("\n".join(errors) + "\n")
+    sys.exit(1 if errors else 0)
 
 
 def format_vpn_data(data):
@@ -1235,7 +1241,7 @@ def main():
     elif cmd == "connect" and len(sys.argv) > 2:
         cmd_connect(sys.argv[2])
     elif cmd == "disconnect" and len(sys.argv) > 2:
-        cmd_disconnect(sys.argv[2])
+        cmd_disconnect(sys.argv[2:])
     elif cmd == "save":
         cmd_save()
     elif cmd == "delete" and len(sys.argv) > 2:

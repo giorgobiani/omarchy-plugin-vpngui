@@ -1,7 +1,8 @@
 # omarchy-plugin-vpngui
 
 All your VPNs in one place in the [Omarchy](https://omarchy.org/) bar:
-Cisco AnyConnect and the other OpenConnect VPNs, plus OpenVPN. Password, SMS,
+Cisco AnyConnect and the other OpenConnect VPNs, plus OpenVPN, with as many
+connected at the same time as you need. Password, SMS,
 MFA and OTP prompts show up in the bar panel, so you don't need `nm-applet`
 or a terminal.
 
@@ -151,17 +152,42 @@ Profiles you already created in NetworkManager (`nm-connection-editor`,
 `nmcli`) show up as well, as long as they are OpenConnect or OpenVPN
 connections.
 
+### Several VPNs at once
+
+You can have several VPNs connected at the same time, for example a company
+VPN and a client's. Each gets its own tunnel.
+
+- **Every connection has its own switch** in the list. It turns only that VPN
+  on or off, and spins while it signs in, connects or disconnects.
+- **The header** shows what's up: the connected VPN's name, or all their
+  names with "2 connected". While a VPN signs in, the header shows that one,
+  with "Also connected: …" underneath.
+- **The header switch is the master switch.** Off disconnects *every* VPN.
+  On connects the last one you used. During a sign-in it cancels the
+  sign-in.
+- One sign-in runs at a time. While one is in progress, the other switches
+  are dimmed until it finishes or you cancel it. Disconnecting still works.
+- The bar icon's tooltip lists every connected VPN.
+
+This works as long as the VPNs don't claim the same networks. If two of them
+route all traffic (no split tunnel), the last one connected usually wins, so
+turn on **Split tunnel** where you can. Networks that overlap (two VPNs both
+pushing `10.0.0.0/8`, say) can't be fixed on your side. DNS works: each VPN's
+own domains go to that VPN's DNS servers.
+
 ### Mouse and keys
 
 | Action | What it does |
 |--------|--------------|
 | Left click on the icon | Open / close the panel |
-| Middle click on the icon | Connect / disconnect the current or last used VPN |
-| Toggle in the panel header | Same as middle click |
-| `↑` `↓` / `j` `k`, `Enter` | Pick a connection, connect / disconnect |
+| Middle click on the icon | Same as the header switch: disconnect every VPN, or connect the last used one |
+| Header switch | Master switch: off disconnects every VPN, on connects the last used one |
+| Switch on a connection | Connect / disconnect that VPN only |
+| Click a connection, or `↑` `↓` / `j` `k` then `Enter` | Connect / disconnect that VPN |
+| `d` or `x` | Disconnect the selected VPN |
+| `D` (Shift+d) | Disconnect every VPN |
 | `n` | New connection |
 | `e` | Edit the selected connection |
-| `d` | Disconnect |
 | `r` | Refresh |
 | `Esc` | Cancel the login in progress, or close the panel |
 | `Tab` | Switch to the next bar panel |
@@ -206,11 +232,12 @@ o.bind("SUPER + ALT + V", "VPN", "omarchy-shell shota.openconnect toggle")
 ```bash
 omarchy-shell shota.openconnect open | close | toggle | refresh
 omarchy-shell shota.openconnect connect "<name or uuid>"
-omarchy-shell shota.openconnect disconnect
+omarchy-shell shota.openconnect disconnect                 # every connected VPN
+omarchy-shell shota.openconnect disconnectOne "<name or uuid>"
 omarchy-shell shota.openconnect cancel
 omarchy-shell shota.openconnect add
 omarchy-shell shota.openconnect edit "<name or uuid>"
-omarchy-shell shota.openconnect status   # human-readable, e.g. "Connected · Work VPN"
+omarchy-shell shota.openconnect status   # e.g. "Connected · Work VPN, Client VPN" or "Disconnected"
 omarchy-shell shota.openconnect phase    # idle | authenticating | browser | prompt | connecting
 omarchy-shell shota.openconnect profiles # JSON: [{ uuid, name, protocol, state }]
 ```

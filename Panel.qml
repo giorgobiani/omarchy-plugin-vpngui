@@ -25,7 +25,20 @@ Panel {
   readonly property var prompt: vpn.prompt
   readonly property bool promptOpen: vpn.phase === "prompt" && prompt !== null
   readonly property var working: vpn.phase !== "idle" ? vpn.connectionByUuid(vpn.activeUuid) : null
-  readonly property var heroConnection: vpn.connected || working || lastUsedConnection
+  readonly property int connectedCount: vpn.connectedList.length
+  readonly property string connectedNames: {
+    var names = []
+    for (var i = 0; i < vpn.connectedList.length; i++) names.push(vpn.connectedList[i].name)
+    return names.join(", ")
+  }
+  // Anything up or coming up, which the header switch would take down.
+  readonly property bool anyActive: {
+    for (var i = 0; i < vpn.connections.length; i++) {
+      var state = vpn.connections[i].state
+      if (state === "activated" || state === "activating") return true
+    }
+    return false
+  }
   readonly property var lastUsedConnection: {
     var best = null
     for (var i = 0; i < vpn.connections.length; i++) {
@@ -35,20 +48,63 @@ Panel {
     return best
   }
 
-  readonly property string heroMeta: {
+  readonly property string loginText: {
     if (vpn.phase === "prompt") return "Waiting for you"
     if (vpn.phase === "authenticating") return "Signing in…"
     if (vpn.phase === "browser") return "Browser sign-in"
     if (vpn.phase === "connecting") return "Connecting…"
-    if (vpn.connected) return "Connected · " + vpn.connected.name
-    if (vpn.connections.length === 0) return "No VPN profiles"
-    return "Disconnected · " + heroConnection.gateway
+    return ""
+  }
+
+  // Header: the VPN being signed in to, the connected one(s), or the last used.
+  readonly property string heroTitle: {
+    if (working) return working.name
+    if (connectedCount > 0) return connectedNames
+    return lastUsedConnection ? lastUsedConnection.name : "VPN"
+  }
+
+  readonly property string heroMeta: {
+    if (loginText !== "") return loginText
+    if (connectedCount === 1) return "Connected"
+    if (connectedCount > 1) return connectedCount + " connected"
+    return vpn.connections.length === 0 ? "No VPN profiles" : "Disconnected"
+  }
+
+  readonly property string heroDetail: {
+    if (working && connectedCount > 0) return "Also connected: " + connectedNames
+    if (connectedCount > 1) return "The switch above disconnects all of them. Each connection below has its own."
+    return ""
+  }
+
+  // Bar tooltip and `status` IPC.
+  readonly property string summary: {
+    if (working) return loginText + " · " + working.name
+    if (connectedCount > 0) return "Connected · " + connectedNames
+    return vpn.connections.length === 0 ? "No VPN profiles" : "Disconnected"
+  }
+
+  // Header switch and middle click: off takes every VPN down, on brings the
+  // last used one up, and during a login it cancels it.
+  function masterToggle() {
+    if (vpn.phase !== "idle") vpn.cancel()
+    else if (anyActive) vpn.disconnectAll()
+    else if (lastUsedConnection) vpn.connect(lastUsedConnection.uuid)
+  }
+
+  function disconnectSelected() {
+    var conn = vpn.connections[rowIndex]
+    if (conn && vpn.isActive(conn.uuid)) vpn.disconnect(conn.uuid)
   }
 
   function activateRow(index) {
     if (index === vpn.connections.length) return startEdit("")
     var conn = vpn.connections[index]
-    if (conn) vpn.toggle(conn.uuid)
+    if (!conn) return
+    if (vpn.loginRunning && !vpn.isActive(conn.uuid) && !vpn.isWorking(conn.uuid)) {
+      vpn.lastError = "Finish or cancel the current sign-in first"
+      return
+    }
+    vpn.toggle(conn.uuid)
   }
 
   function startEdit(uuid) {
@@ -92,7 +148,7 @@ Panel {
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
     function refresh(): string { vpn.refresh(); return "ok" }
-    function status(): string { return root.heroMeta }
+    function status(): string { return root.summary }
     // Machine-readable login state for other plugins: idle | authenticating | browser | prompt | connecting
     function phase(): string { return vpn.phase }
     // Every profile (OpenConnect, OpenVPN, OpenVPN 3) as JSON, for other plugins
@@ -121,9 +177,17 @@ Panel {
       }
       return "not found"
     }
+    // Every connected VPN.
     function disconnect(): string {
-      if (vpn.connected) vpn.disconnect(vpn.connected.uuid)
+      vpn.disconnectAll()
       return "ok"
+    }
+    function disconnectOne(name: string): string {
+      for (var i = 0; i < vpn.connections.length; i++) {
+        var c = vpn.connections[i]
+        if (c.name === name || c.uuid === name) { vpn.disconnect(c.uuid); return "ok" }
+      }
+      return "not found"
     }
   }
 
@@ -133,9 +197,9 @@ Panel {
     bar: root.bar
     text: vpn.connected ? "󰦝" : "󰦞"
     foreground: vpn.connected ? root.barForeground : Qt.darker(root.barForeground, 1.55)
-    tooltipText: root.heroMeta
+    tooltipText: root.summary
     onPressed: function(buttonCode) {
-      if (buttonCode === Qt.MiddleButton && root.heroConnection) vpn.toggle(root.heroConnection.uuid)
+      if (buttonCode === Qt.MiddleButton) root.masterToggle()
       else root.toggle()
     }
   }
@@ -170,10 +234,12 @@ Panel {
         if (root.promptOpen) vpn.cancel()
         else root.close()
       }
+      onDeleteRequested: root.disconnectSelected()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
         if (t === "r" || t === "R") vpn.refresh()
-        else if ((t === "d" || t === "D") && vpn.connected) vpn.disconnect(vpn.connected.uuid)
+        else if (t === "d") root.disconnectSelected()
+        else if (t === "D") vpn.disconnectAll()
         else if (t === "n" || t === "N") root.startEdit("")
         else if ((t === "e" || t === "E") && vpn.connections[root.rowIndex]) root.startEdit(vpn.connections[root.rowIndex].uuid)
       }
@@ -200,7 +266,7 @@ Panel {
             PanelHero {
               id: hero
               width: parent.width
-              title: root.heroConnection ? root.heroConnection.name : "VPN"
+              title: root.heroTitle
               meta: root.heroMeta
               foreground: root.foreground
               fontFamily: root.fontFamily
@@ -215,14 +281,28 @@ Panel {
               }
               trailingControl: Component {
                 ToggleSwitch {
-                  visible: root.heroConnection !== null
-                  checked: vpn.connected !== null || vpn.phase !== "idle"
+                  visible: vpn.connections.length > 0
+                  checked: root.anyActive || vpn.phase !== "idle"
                   busy: vpn.phase === "authenticating" || vpn.phase === "connecting"
+                    || Object.keys(vpn.disconnecting).length > 0
                   foreground: hero.foreground
-                  onToggled: if (root.heroConnection) vpn.toggle(root.heroConnection.uuid)
+                  onToggled: root.masterToggle()
                 }
               }
             }
+          }
+
+          // PanelHero's `detail` is a short badge beside the title, so the longer
+          // note about several connections gets a wrapped line of its own.
+          Text {
+            visible: text !== ""
+            width: parent.width
+            text: root.heroDetail
+            textFormat: Text.PlainText
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
           }
 
           PromptCard {
@@ -454,10 +534,25 @@ Panel {
     id: row
     property var conn: null
     property int rowIndex: 0
-    readonly property bool isActive: conn && conn.state === "activated"
-    readonly property bool isWorking: conn && vpn.phase !== "idle" && vpn.activeUuid === conn.uuid
+    readonly property bool isActive: conn !== null && conn.state === "activated"
+    readonly property bool isLoggingIn: conn !== null && vpn.phase !== "idle" && vpn.activeUuid === conn.uuid
+    readonly property bool isDisconnecting: conn !== null && vpn.disconnecting[conn.uuid] === true
+    // Anything in flight for this row: its login, a teardown, NetworkManager
+    // still activating it, or a just-finished change waiting for the next list.
+    readonly property bool isWorking: conn !== null
+      && (vpn.isWorking(conn.uuid) || conn.state === "activating")
+    // Only one login runs at a time; other rows can still be disconnected.
+    readonly property bool canToggle: isActive || isWorking || !vpn.loginRunning
     readonly property string detail: !conn ? "" : conn.protocol !== "openvpn" ? conn.gateway
       : (conn.gateway ? conn.gateway + " · " : "") + (conn.sso ? "OpenVPN SSO" : "OpenVPN")
+    readonly property string subtitle: {
+      if (!conn) return ""
+      if (isDisconnecting) return "Disconnecting…"
+      if (isLoggingIn) return root.loginText
+      if (conn.state === "activating") return "Connecting…"
+      if (isActive) return "Connected" + (detail ? " · " + detail : "")
+      return detail
+    }
 
     hasCursor: root.cursorActive && root.rowIndex === rowIndex
     foreground: root.foreground
@@ -505,7 +600,7 @@ Panel {
         Text {
           textFormat: Text.PlainText
           Layout.fillWidth: true
-          text: row.isWorking ? "Connecting…" : (row.isActive ? "Connected" : row.detail)
+          text: row.subtitle
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -534,6 +629,18 @@ Panel {
         foreground: root.foreground
         fontFamily: root.fontFamily
         onClicked: if (row.conn) root.startEdit(row.conn.uuid)
+      }
+
+      // This connection only; the header switch covers all of them.
+      ToggleSwitch {
+        cursorRing: false
+        checked: row.isActive || row.isWorking
+        busy: row.isWorking
+        interactive: row.canToggle
+        opacity: row.canToggle ? 1.0 : 0.4
+        foreground: root.foreground
+        onToggled: if (row.conn) vpn.toggle(row.conn.uuid)
+        onHovered: function(isHovered) { if (isHovered) { root.cursorActive = true; root.rowIndex = row.rowIndex } }
       }
     }
   }

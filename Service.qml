@@ -22,17 +22,37 @@ Item {
   readonly property string helperPath: Qt.resolvedUrl("helper.py").toString().replace(/^file:\/\//, "")
   readonly property bool busy: phase !== "idle" || controlProcess.running
   readonly property bool saving: saveProcess.running
-  readonly property var connected: {
+  // Several VPNs can be up at once; `connected` is the first of them.
+  readonly property var connectedList: {
+    var out = []
     for (var i = 0; i < connections.length; i++) {
-      if (connections[i].state === "activated") return connections[i]
+      if (connections[i].state === "activated") out.push(connections[i])
     }
-    return null
+    return out
   }
+  readonly property var connected: connectedList.length > 0 ? connectedList[0] : null
+  // Profiles being taken down: { uuid: true }. Kept until the next list shows
+  // the result, so switches don't flicker back in between.
+  property var disconnecting: ({})
+  // A login that just finished, until the next list shows its new state.
+  property string settlingUuid: ""
+  property bool settleOnRefresh: false
   readonly property int refreshIntervalSec: Math.max(3, parseInt(settings && settings.refreshIntervalSec) || 10)
 
   function refresh() {
     if (listProcess.running) return
     listProcess.running = true
+  }
+
+  // Refresh, and clear the in-between states once the new list is in. A list
+  // already running may predate the change, so wait for the one after it.
+  function settleAfterRefresh() {
+    if (listProcess.running) {
+      settleTimer.restart()
+      return
+    }
+    settleOnRefresh = true
+    refresh()
   }
 
   function connectionByUuid(uuid) {
@@ -80,12 +100,42 @@ Item {
   }
 
   function disconnect(uuid) {
-    if (controlProcess.running || !uuid) return
+    if (uuid) disconnectMany([uuid])
+  }
+
+  function disconnectAll() {
+    var uuids = []
+    for (var i = 0; i < connections.length; i++) {
+      var state = connections[i].state
+      if (state === "activated" || state === "activating") uuids.push(connections[i].uuid)
+    }
+    disconnectMany(uuids)
+  }
+
+  function disconnectMany(uuids) {
+    if (controlProcess.running || uuids.length === 0) return
     lastError = ""
-    statusText = "Disconnecting…"
-    controlProcess.command = ["python3", helperPath, "disconnect", uuid]
+    var pending = {}
+    for (var i = 0; i < uuids.length; i++) pending[uuids[i]] = true
+    disconnecting = pending
+    statusText = uuids.length > 1 ? "Disconnecting all…" : "Disconnecting…"
+    controlProcess.command = ["python3", helperPath, "disconnect"].concat(uuids)
     controlProcess.running = true
   }
+
+  // Per-profile state for the rows: "connected", "connecting" (a login, an
+  // activation or a teardown in progress) or "".
+  function isWorking(uuid) {
+    return (phase !== "idle" && activeUuid === uuid) || settlingUuid === uuid || disconnecting[uuid] === true
+  }
+
+  function isActive(uuid) {
+    var conn = connectionByUuid(uuid)
+    return conn !== null && (conn.state === "activated" || conn.state === "activating")
+  }
+
+  // Only one login runs at a time; another profile can connect once it's done.
+  readonly property bool loginRunning: connectProcess.running
 
   signal saved(string uuid)
 
@@ -112,6 +162,7 @@ Item {
     var conn = connectionByUuid(uuid)
     if (!conn) return
     if (phase !== "idle" && activeUuid === uuid) cancel()
+    else if (disconnecting[uuid] === true) return
     else if (conn.state === "activated" || conn.state === "activating") disconnect(uuid)
     else connect(uuid)
   }
@@ -147,6 +198,11 @@ Item {
         try {
           var parsed = JSON.parse(text)
           root.connections = parsed.connections || []
+          if (root.settleOnRefresh) {
+            root.settleOnRefresh = false
+            root.settlingUuid = ""
+            root.disconnecting = ({})
+          }
           if (parsed.openvpn) root.openvpn = parsed.openvpn
           if (!parsed.ok && parsed.error) root.lastError = parsed.error
         } catch (e) {
@@ -161,11 +217,12 @@ Item {
     stdinEnabled: true
     stdout: SplitParser { onRead: function(data) { root.handleEvent(data) } }
     onExited: function(exitCode) {
+      root.settlingUuid = root.activeUuid
       root.phase = "idle"
       root.prompt = null
       root.statusText = ""
       root.authUrl = ""
-      root.refresh()
+      root.settleAfterRefresh()
     }
   }
 
@@ -208,8 +265,14 @@ Item {
     onExited: function(exitCode) {
       root.statusText = ""
       if (exitCode !== 0) root.lastError = String(controlStderr.text || "Command failed").trim()
-      root.refresh()
+      root.settleAfterRefresh()
     }
+  }
+
+  Timer {
+    id: settleTimer
+    interval: 150
+    onTriggered: root.settleAfterRefresh()
   }
 
   Timer {
