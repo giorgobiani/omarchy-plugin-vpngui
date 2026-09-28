@@ -41,7 +41,7 @@ Panel {
     if (vpn.phase === "browser") return "Browser sign-in"
     if (vpn.phase === "connecting") return "Connecting…"
     if (vpn.connected) return "Connected · " + vpn.connected.name
-    if (vpn.connections.length === 0) return "No OpenConnect profiles"
+    if (vpn.connections.length === 0) return "No VPN profiles"
     return "Disconnected · " + heroConnection.gateway
   }
 
@@ -78,6 +78,10 @@ Panel {
     id: vpn
     settings: root.settings
     onSaved: function(uuid) { root.stopEdit() }
+    onFilePicked: function(path) {
+      editor.setFile(path)
+      if (!root.opened) root.open()
+    }
   }
 
   IpcHandler {
@@ -91,6 +95,16 @@ Panel {
     function status(): string { return root.heroMeta }
     // Machine-readable login state for other plugins: idle | authenticating | browser | prompt | connecting
     function phase(): string { return vpn.phase }
+    // Every profile (OpenConnect, OpenVPN, OpenVPN 3) as JSON, for other plugins
+    // such as Remote Desktop: [{ uuid, name, protocol, state }]
+    function profiles(): string {
+      var out = []
+      for (var i = 0; i < vpn.connections.length; i++) {
+        var c = vpn.connections[i]
+        out.push({ uuid: c.uuid, name: c.name, protocol: c.protocol, state: c.state })
+      }
+      return JSON.stringify(out)
+    }
     function connect(name: string): string {
       for (var i = 0; i < vpn.connections.length; i++) {
         var c = vpn.connections[i]
@@ -237,6 +251,15 @@ Panel {
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
               wrapMode: Text.WordWrap
+            }
+
+            Button {
+              visible: vpn.phase === "browser" && vpn.authUrl !== ""
+              text: "Open sign-in page"
+              bordered: true
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: vpn.openAuthUrl()
             }
 
             Button {
@@ -433,6 +456,8 @@ Panel {
     property int rowIndex: 0
     readonly property bool isActive: conn && conn.state === "activated"
     readonly property bool isWorking: conn && vpn.phase !== "idle" && vpn.activeUuid === conn.uuid
+    readonly property string detail: !conn ? "" : conn.protocol !== "openvpn" ? conn.gateway
+      : (conn.gateway ? conn.gateway + " · " : "") + (conn.sso ? "OpenVPN SSO" : "OpenVPN")
 
     hasCursor: root.cursorActive && root.rowIndex === rowIndex
     foreground: root.foreground
@@ -480,7 +505,7 @@ Panel {
         Text {
           textFormat: Text.PlainText
           Layout.fillWidth: true
-          text: row.isWorking ? "Connecting…" : (row.isActive ? "Connected" : (row.conn ? row.conn.gateway : ""))
+          text: row.isWorking ? "Connecting…" : (row.isActive ? "Connected" : row.detail)
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -565,17 +590,49 @@ Panel {
     property string reportedOs: ""
     property string gpTarget: ""
     property bool splitTunnel: false
-    readonly property bool ssoCapable: protocol === "anyconnect" || protocol === "gp" || protocol === "fortinet"
-    readonly property bool useSso: sso && ssoCapable
-    readonly property bool isGp: protocol === "gp"
+    property string gateway: ""
+    readonly property bool isOpenvpn: protocol === "openvpn"
     readonly property bool isNew: root.editUuid === ""
-    readonly property bool valid: nameField.text.trim() !== "" && gatewayField.text.trim() !== ""
+    // OpenVPN picks its backend by sign-in at import time (NetworkManager or
+    // OpenVPN 3), so an existing OpenVPN profile can't switch sign-in.
+    readonly property bool ssoCapable: protocol === "anyconnect" || protocol === "gp" || protocol === "fortinet"
+      || (isOpenvpn && isNew)
+    readonly property bool useSso: sso && (ssoCapable || isOpenvpn)
+    readonly property bool isGp: protocol === "gp"
+    readonly property string missingBackend: !isOpenvpn ? ""
+      : (useSso ? (vpn.openvpn.openvpn3 ? "" : "Browser SSO for OpenVPN needs OpenVPN 3: omarchy pkg aur add openvpn3")
+                : (vpn.openvpn.nm ? "" : "OpenVPN needs NetworkManager's plugin: omarchy pkg add networkmanager-openvpn"))
+    readonly property bool valid: nameField.text.trim() !== "" && missingBackend === ""
+      && (isOpenvpn ? (!isNew || fileField.text.trim() !== "") : gatewayField.text.trim() !== "")
+    readonly property var protocolOptions: {
+      var openconnect = [
+        { value: "anyconnect", label: "Cisco AnyConnect / ocserv" },
+        { value: "gp", label: "Palo Alto GlobalProtect" },
+        { value: "nc", label: "Juniper Network Connect" },
+        { value: "pulse", label: "Pulse / Ivanti Secure" },
+        { value: "f5", label: "F5 BIG-IP" },
+        { value: "fortinet", label: "Fortinet FortiGate" },
+        { value: "array", label: "Array Networks" }
+      ]
+      var openvpn = { value: "openvpn", label: "OpenVPN (.ovpn file)" }
+      if (isNew) return openconnect.concat([openvpn])
+      return isOpenvpn ? [openvpn] : openconnect
+    }
+
+    // A file chosen in the portal dialog; names the connection when it has no name yet.
+    function setFile(path) {
+      fileField.text = path
+      if (nameField.text.trim() === "")
+        nameField.text = path.replace(/^.*\//, "").replace(/\.(ovpn|conf)$/i, "")
+    }
     spacing: Style.space(8)
 
     function load(conn) {
       confirmDelete = false
       nameField.text = conn ? conn.name : ""
       gatewayField.text = conn ? conn.gateway : ""
+      gateway = conn ? (conn.gateway || "") : ""
+      fileField.text = ""
       protocol = conn ? (conn.protocol || "anyconnect") : "anyconnect"
       groupField.text = conn ? (conn.usergroup || "") : ""
       sso = conn ? conn.sso === true : false
@@ -595,9 +652,10 @@ Panel {
       var profile = {
         uuid: root.editUuid,
         name: nameField.text.trim(),
-        gateway: gatewayField.text.trim(),
+        gateway: form.isOpenvpn ? "" : gatewayField.text.trim(),
+        ovpnFile: form.isOpenvpn && form.isNew ? fileField.text.trim() : "",
         protocol: form.protocol,
-        usergroup: form.isGp ? form.gpTarget : groupField.text.trim(),
+        usergroup: form.isOpenvpn ? "" : (form.isGp ? form.gpTarget : groupField.text.trim()),
         username: form.useSso ? "" : userField.text.trim(),
         password: form.remember && !form.useSso ? passwordField.text : "",
         rememberPassword: form.remember && !form.useSso,
@@ -616,9 +674,10 @@ Panel {
       fontFamily: root.fontFamily
     }
 
-    FormField { id: nameField; label: "Name"; placeholder: "Work VPN"; next: gatewayField }
+    FormField { id: nameField; label: "Name"; placeholder: "Work VPN"; next: form.isOpenvpn ? null : gatewayField }
     FormField {
       id: gatewayField
+      visible: !form.isOpenvpn
       label: form.isGp ? "Portal" : (form.protocol === "fortinet" ? "Gateway (host or host:port)" : "Gateway")
       placeholder: form.protocol === "fortinet" ? "vpn.example.com:10443" : "vpn.example.com"
       next: groupField.visible ? groupField : null
@@ -630,16 +689,48 @@ Panel {
       showLabel: false
       value: form.protocol
       fontFamily: root.fontFamily
-      options: [
-        { value: "anyconnect", label: "Cisco AnyConnect / ocserv" },
-        { value: "gp", label: "Palo Alto GlobalProtect" },
-        { value: "nc", label: "Juniper Network Connect" },
-        { value: "pulse", label: "Pulse / Ivanti Secure" },
-        { value: "f5", label: "F5 BIG-IP" },
-        { value: "fortinet", label: "Fortinet FortiGate" },
-        { value: "array", label: "Array Networks" }
-      ]
+      options: form.protocolOptions
       onChanged: function(value) { form.protocol = value }
+    }
+
+    // OpenVPN: the provider's .ovpn file is imported once.
+    FormLabel { visible: form.isOpenvpn && form.isNew; text: "Configuration file (.ovpn)" }
+    RowLayout {
+      visible: form.isOpenvpn && form.isNew
+      width: parent.width
+      spacing: Style.space(6)
+
+      TextField {
+        id: fileField
+        Layout.fillWidth: true
+        placeholderText: "~/Downloads/work.ovpn"
+        foreground: root.foreground
+        font.family: root.fontFamily
+        horizontalPadding: Style.spacing.controlGap
+        verticalPadding: Style.spacing.controlPaddingY
+        onAccepted: form.submit()
+        Keys.onEscapePressed: root.stopEdit()
+      }
+
+      Button {
+        text: "Browse…"
+        bordered: true
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        onClicked: vpn.pickFile()
+      }
+    }
+
+    Text {
+      visible: form.isOpenvpn && !form.isNew
+      width: parent.width
+      text: (form.gateway ? "Server " + form.gateway + " · " : "")
+        + (form.sso ? "Browser SSO via OpenVPN 3" : "Password / certificate via NetworkManager")
+        + ". To change the file or sign-in, delete the connection and import it again."
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      wrapMode: Text.WordWrap
     }
 
     FormLabel { visible: form.ssoCapable; text: "Sign-in" }
@@ -649,17 +740,34 @@ Panel {
       showLabel: false
       value: form.sso ? "sso" : "password"
       fontFamily: root.fontFamily
-      options: [
-        { value: "password", label: "Username & password (+ code / token)" },
-        { value: "sso", label: "Browser SSO (Microsoft, Okta, Google…)" }
-      ]
+      options: form.isOpenvpn
+        ? [
+          { value: "password", label: "Username & password / certificate (+ code)" },
+          { value: "sso", label: "Browser SSO / SAML (OpenVPN 3)" }
+        ]
+        : [
+          { value: "password", label: "Username & password (+ code / token)" },
+          { value: "sso", label: "Browser SSO (Microsoft, Okta, Google…)" }
+        ]
       onChanged: function(value) { form.sso = value === "sso" }
+    }
+
+    Text {
+      visible: form.missingBackend !== ""
+      width: parent.width
+      text: form.missingBackend
+      color: root.urgent
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      wrapMode: Text.WordWrap
     }
 
     Text {
       visible: form.useSso
       width: parent.width
-      text: form.isGp
+      text: form.isOpenvpn
+        ? "OpenVPN 3 opens the sign-in page in your default browser (OpenVPN Access Server, CloudConnexa and other servers using OpenVPN web authentication)."
+        : form.isGp
         ? "Signs in through your default browser via gpauth."
         : (form.protocol === "fortinet"
           ? "Opens the FortiGate SSO page in your default browser; it hands back to 127.0.0.1:8020."
@@ -712,6 +820,7 @@ Panel {
     }
 
     Toggle {
+      visible: !(form.isOpenvpn && form.useSso)
       width: parent.width
       label: "Split tunnel"
       description: "Only company networks and names go through the VPN; internet and DNS stay on your connection"
@@ -723,7 +832,7 @@ Panel {
 
     FormField {
       id: groupField
-      visible: !form.isGp
+      visible: !form.isGp && !form.isOpenvpn
       label: form.protocol === "fortinet" ? "Realm (optional)" : "Group (optional)"
       placeholder: form.protocol === "fortinet" ? "Leave empty for the default realm" : "Leave empty to pick at login"
       next: userField.visible ? userField : null
@@ -732,7 +841,7 @@ Panel {
       id: userField
       visible: !form.useSso
       label: "Username (optional)"
-      placeholder: "Asked at login when empty"
+      placeholder: form.isOpenvpn ? "Asked at login when the server needs one" : "Asked at login when empty"
       next: form.remember ? passwordField : null
     }
 

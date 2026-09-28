@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
-"""Backend for the OpenConnect bar widget.
+"""Backend for the VPN bar widget (OpenConnect and OpenVPN).
 
-  helper.py list              JSON list of NetworkManager OpenConnect profiles
-  helper.py connect <uuid>    Interactive login; JSON events on stdout,
+  helper.py list              JSON list of VPN profiles: NetworkManager OpenConnect
+                              and OpenVPN connections, plus OpenVPN 3 (SSO) profiles
+  helper.py connect <id>      Interactive login; JSON events on stdout,
                               JSON answers on stdin ({"answer": "..."} / {"cancel": true})
-  helper.py disconnect <uuid>
+  helper.py disconnect <id>
   helper.py save              Create / update a profile from JSON on stdin
-  helper.py delete <uuid>
+  helper.py delete <id>
+  helper.py pick-file         Native file dialog for an .ovpn file; JSON {"path": ...}
+
+Profile ids are NetworkManager UUIDs, or "ovpn3:<config id>" for OpenVPN 3
+profiles (used for browser SSO / SAML, which NetworkManager's OpenVPN plugin
+can't do).
 
 Passwords are never written to disk by this helper: they live in the Secret
 Service keyring (gnome-keyring) via secret-tool, travel over stdin only, and
@@ -82,6 +88,13 @@ SSO_TIMEOUT = 300
 GPAUTH_OS = {"win": "Windows", "mac-intel": "Mac", "linux-64": "Linux", "linux": "Linux"}
 KEYRING_SERVICE = "omarchy-openconnect"
 PROTOCOLS = ("anyconnect", "gp", "nc", "pulse", "f5", "fortinet", "array")
+OPENCONNECT_SERVICE = "org.freedesktop.NetworkManager.openconnect"
+OPENVPN_SERVICE = "org.freedesktop.NetworkManager.openvpn"
+OVPN3_PREFIX = "ovpn3:"
+OVPN3_CONFIG_ROOT = "/net/openvpn/v3/configuration/"
+# NM-OpenVPN connection types that take a username / password.
+OPENVPN_PASSWORD_TYPES = ("password", "password-tls")
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 NEW_PROFILE_DATA = {
     "authtype": "password", "autoconnect-flags": "0", "certsigs-flags": "0", "cookie-flags": "2",
     "disable_udp": "no", "enable_csd_trojan": "no", "gateway-flags": "2", "gwcert-flags": "2",
@@ -139,31 +152,143 @@ def cmd_list():
         if len(parts) < 3 or parts[2] != "vpn":
             continue
         name, uuid = parts[0], parts[1]
-        if nmcli("-g", "vpn.service-type", "connection", "show", uuid).stdout.strip() != "org.freedesktop.NetworkManager.openconnect":
+        service = nmcli("-g", "vpn.service-type", "connection", "show", uuid).stdout.strip()
+        if service not in (OPENCONNECT_SERVICE, OPENVPN_SERVICE):
             continue
         data = vpn_data(uuid)
-        conns.append({
+        conn_state = state.get(uuid, {})
+        entry = {
             "name": name,
             "uuid": uuid,
+            "backend": "openconnect",
             "gateway": data.get("gateway", ""),
             "protocol": data.get("protocol", "anyconnect"),
             "state": active.get(uuid, ""),
             "usergroup": data.get("usergroup", ""),
-            "username": state.get(uuid, {}).get("username", ""),
-            "rememberPassword": bool(state.get(uuid, {}).get("rememberPassword")),
-            "sso": bool(state.get(uuid, {}).get("sso")),
+            "username": conn_state.get("username", ""),
+            "rememberPassword": bool(conn_state.get("rememberPassword")),
+            "sso": bool(conn_state.get("sso")),
             "hip": data.get("enable_csd_trojan") == "yes" and bool(data.get("csd_wrapper")),
             "reportedOs": data.get("reported_os", ""),
-            "lastUsed": state.get(uuid, {}).get("lastUsed", 0),
+            "lastUsed": conn_state.get("lastUsed", 0),
             "splitTunnel": nmcli("-g", "ipv4.never-default", "connection", "show", uuid).stdout.strip() == "yes",
+        }
+        if service == OPENVPN_SERVICE:
+            entry.update({
+                "backend": "nm-openvpn", "protocol": "openvpn", "usergroup": "", "sso": False, "hip": False,
+                "reportedOs": "", "gateway": openvpn_remote(data.get("remote", "")),
+                # NM-OpenVPN keeps the username in the profile itself.
+                "username": data.get("username", ""),
+                "needsPassword": data.get("connection-type", "") in OPENVPN_PASSWORD_TYPES,
+            })
+        conns.append(entry)
+    conns += ovpn3_profiles(state)
+    json.dump({"ok": res.returncode == 0, "error": res.stderr.strip(), "connections": conns,
+               "openvpn": {"nm": os.path.exists("/usr/lib/NetworkManager/VPN/nm-openvpn-service.name"),
+                           "openvpn3": bool(shutil.which("openvpn3"))}}, sys.stdout)
+
+
+def openvpn_remote(remote):
+    """First server of an NM-OpenVPN "remote" list (host[:port[:proto]], comma-separated)."""
+    first = remote.split(",")[0].strip()
+    parts = first.split(":")
+    return ":".join(parts[:2]) if len(parts) > 1 and parts[1] not in ("", "1194") else parts[0]
+
+
+# ----- OpenVPN 3 (browser SSO / SAML) ------------------------------------------
+#
+# NetworkManager's OpenVPN plugin can't do OpenVPN web authentication
+# (WEB_AUTH / OPEN_URL), so SSO profiles live in openvpn3-linux instead. It runs
+# unprivileged over D-Bus and announces IV_SSO=webauth to the server.
+
+OVPN3_CONNECTED = 7   # StatusMinor CONN_CONNECTED on net.openvpn.v3.sessions
+
+
+def ovpn3_id(config_path):
+    return OVPN3_PREFIX + config_path.rsplit("/", 1)[-1]
+
+
+def ovpn3_path(profile_id):
+    return OVPN3_CONFIG_ROOT + profile_id[len(OVPN3_PREFIX):]
+
+
+def ovpn3_run(*args, **kw):
+    return subprocess.run(["openvpn3", *args], capture_output=True, text=True, **kw)
+
+
+def ovpn3_sessions():
+    """{config path: (session path, status minor)} for this user's OpenVPN 3 sessions."""
+    if not shutil.which("openvpn3"):
+        return {}
+    try:
+        from gi.repository import Gio, GLib
+        bus = Gio.bus_get_sync(Gio.BusType.SYSTEM)
+        paths = bus.call_sync("net.openvpn.v3.sessions", "/net/openvpn/v3/sessions", "net.openvpn.v3.sessions",
+                              "FetchAvailableSessions", None, None, 0, 5000, None).unpack()[0]
+        out = {}
+        for path in paths:
+            def prop(name):
+                return bus.call_sync("net.openvpn.v3.sessions", path, "org.freedesktop.DBus.Properties", "Get",
+                                     GLib.Variant("(ss)", ("net.openvpn.v3.sessions", name)), None, 0, 5000,
+                                     None).unpack()[0]
+            out[prop("config_path")] = (path, prop("status")[1])
+        return out
+    except Exception:
+        return {}
+
+
+def ovpn3_remote(path):
+    """Server address from an imported profile (for display only)."""
+    res = ovpn3_run("config-dump", "--path", path)
+    m = re.search(r"^\s*remote\s+(\S+)(?:\s+(\d+))?", res.stdout, re.M)
+    if not m:
+        return ""
+    return m.group(1) + (":" + m.group(2) if m.group(2) and m.group(2) != "1194" else "")
+
+
+def ovpn3_profiles(state):
+    if not shutil.which("openvpn3"):
+        return []
+    res = ovpn3_run("configs-list", "--json")
+    try:
+        configs = json.loads(res.stdout or "{}")
+    except ValueError:
+        return []
+    sessions = ovpn3_sessions()
+    out = []
+    for path, cfg in sorted(configs.items(), key=lambda kv: kv[1].get("name", "")):
+        pid = ovpn3_id(path)
+        conn_state = state.get(pid, {})
+        session = sessions.get(path)
+        out.append({
+            "name": cfg.get("name", ""), "uuid": pid, "backend": "openvpn3", "protocol": "openvpn",
+            "gateway": conn_state.get("gateway") or ovpn3_remote(path),
+            "state": ("activated" if session[1] == OVPN3_CONNECTED else "activating") if session else "",
+            "usergroup": "", "username": "", "rememberPassword": False, "sso": True, "hip": False,
+            "reportedOs": "", "lastUsed": conn_state.get("lastUsed", 0), "splitTunnel": False,
+            "needsPassword": False,
         })
-    json.dump({"ok": res.returncode == 0, "error": res.stderr.strip(), "connections": conns}, sys.stdout)
+    return out
+
+
+def is_ovpn3(uuid):
+    return uuid.startswith(OVPN3_PREFIX)
+
+
+def nm_service(uuid):
+    return nmcli("-g", "vpn.service-type", "connection", "show", uuid).stdout.strip()
 
 
 def cmd_disconnect(uuid):
-    res = nmcli("connection", "down", uuid)
+    if is_ovpn3(uuid):
+        session = ovpn3_sessions().get(ovpn3_path(uuid))
+        if not session:
+            sys.exit(0)
+        res = ovpn3_run("session-manage", "--path", session[0], "--disconnect")
+    else:
+        res = nmcli("connection", "down", uuid)
     if res.returncode != 0:
-        sys.stderr.write(res.stderr)
+        sys.stderr.write(res.stderr or res.stdout)
     sys.exit(res.returncode)
 
 
@@ -176,6 +301,8 @@ def cmd_save():
     name = str(req.get("name", "")).strip()
     gateway = str(req.get("gateway", "")).strip()
     protocol = str(req.get("protocol", "anyconnect")).strip() or "anyconnect"
+    if protocol == "openvpn":
+        return save_openvpn(req, name)
     if not name or not gateway:
         emit("error", text="Name and gateway are required")
         sys.exit(1)
@@ -247,8 +374,103 @@ def cmd_save():
     emit("saved", uuid=uuid)
 
 
+def apply_password_choice(uuid, name, conn, req):
+    """Keyring handling shared by all profile types; returns the final remember flag."""
+    remember = bool(req.get("rememberPassword"))
+    password = req.get("password") or ""
+    if not remember:
+        keyring_clear(uuid)
+    elif password:
+        if not keyring_set(uuid, name, password):
+            remember = False
+            emit("error", text="Could not store the password in the keyring")
+    elif not keyring_get(uuid):
+        remember = False
+    conn["rememberPassword"] = remember
+    return remember
+
+
+def save_openvpn(req, name):
+    """OpenVPN profiles come from an .ovpn file: into NetworkManager for
+    password / certificate sign-in, into OpenVPN 3 for browser SSO."""
+    if not name:
+        emit("error", text="Name is required")
+        sys.exit(1)
+    uuid = str(req.get("uuid") or "")
+    if not uuid:
+        path = os.path.expanduser(str(req.get("ovpnFile", "")).strip())
+        if not path or not os.path.isfile(path):
+            emit("error", text="Choose the .ovpn file your VPN provider gave you")
+            sys.exit(1)
+        if req.get("sso"):
+            if not shutil.which("openvpn3"):
+                emit("error", text="Browser SSO for OpenVPN needs OpenVPN 3: omarchy pkg aur add openvpn3")
+                sys.exit(1)
+            res = ovpn3_run("config-import", "--config", path, "--name", name, "--persistent")
+            m = re.search(r"(/net/openvpn/v3/configuration/\S+)", res.stdout)
+            if res.returncode != 0 or not m:
+                emit("error", text=((res.stderr or res.stdout).strip().splitlines() or ["Import failed"])[-1])
+                sys.exit(1)
+            uuid = ovpn3_id(m.group(1))
+        else:
+            if not os.path.exists("/usr/lib/NetworkManager/VPN/nm-openvpn-service.name"):
+                emit("error", text="OpenVPN needs NetworkManager's plugin: omarchy pkg add networkmanager-openvpn")
+                sys.exit(1)
+            res = nmcli("connection", "import", "type", "openvpn", "file", path)
+            m = re.search(r"\(([0-9a-f-]{36})\)", res.stdout)
+            if res.returncode != 0 or not m:
+                emit("error", text=((res.stderr or res.stdout).strip().splitlines() or ["Import failed"])[-1])
+                sys.exit(1)
+            uuid = m.group(1)
+
+    state = load_state()
+    conn = state.setdefault(uuid, {})
+    if is_ovpn3(uuid):
+        path = ovpn3_path(uuid)
+        current = json.loads(ovpn3_run("configs-list", "--json").stdout or "{}").get(path, {})
+        if current.get("name") != name:
+            res = ovpn3_run("config-manage", "--path", path, "--rename", name)
+            if res.returncode != 0:
+                emit("error", text=((res.stderr or res.stdout).strip().splitlines() or ["Rename failed"])[-1])
+                sys.exit(1)
+        conn["sso"] = True
+        conn.pop("rememberPassword", None)
+        save_state(state)
+        emit("saved", uuid=uuid)
+        return
+
+    data = vpn_data(uuid)
+    if data.get("connection-type", "") in OPENVPN_PASSWORD_TYPES:
+        # Never let NetworkManager store the password itself: it is asked for
+        # at every connect, and remembered only in the keyring.
+        data["password-flags"] = "2"
+        username = str(req.get("username", "")).strip()
+        if username:
+            data["username"] = username
+        else:
+            data.pop("username", None)
+    never_default = "yes" if req.get("splitTunnel") else "no"
+    res = nmcli("connection", "modify", uuid, "connection.id", name, "connection.autoconnect", "no",
+                "vpn.data", format_vpn_data(data),
+                "ipv4.never-default", never_default, "ipv6.never-default", never_default)
+    if res.returncode != 0:
+        emit("error", text=(res.stderr.strip().splitlines() or ["nmcli failed"])[-1])
+        sys.exit(1)
+    conn["sso"] = False
+    apply_password_choice(uuid, name, conn, req)
+    save_state(state)
+    emit("saved", uuid=uuid)
+
+
 def cmd_delete(uuid):
-    res = nmcli("connection", "delete", uuid)
+    if is_ovpn3(uuid):
+        path = ovpn3_path(uuid)
+        session = ovpn3_sessions().get(path)
+        if session:
+            ovpn3_run("session-manage", "--path", session[0], "--disconnect")
+        res = ovpn3_run("config-remove", "--path", path, "--force")
+    else:
+        res = nmcli("connection", "delete", uuid)
     keyring_clear(uuid)
     state = load_state()
     state.pop(uuid, None)
@@ -659,21 +881,321 @@ class Session:
         return True
 
 
-def cmd_connect(uuid):
-    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
-    session = Session(uuid)
+class PtyLogin:
+    """Drives an interactive CLI (nmcli --ask, openvpn3 session-start) on a pty.
+    A partial line that stays idle is a prompt: it goes to the panel as a JSON
+    event, and the answer is typed back."""
 
-    def on_term(signum, frame):
-        # Cancel from the UI: take openconnect / gpauth down with us.
-        child = session.child
+    read_answer = Session.read_answer   # same wire format as the OpenConnect login
+
+    def __init__(self, uuid):
+        self.uuid = uuid
+        self.state = load_state()
+        self.conn_state = self.state.setdefault(uuid, {})
+        self.stdin_buf = ""
+        self.child = None
+        self.messages = []       # meaningful output since the last prompt
+        self.last_answer = None  # swallow the echo of what was just typed
+        self.error = ""
+        self.new_password = None
+
+    def ask(self, label, message="", secret=False, value="", can_remember=False, remember=False):
+        emit("prompt", label=label, secret=secret, kind="text", message=message, choices=[], pin="",
+             value=value, canRemember=can_remember, remember=remember)
+        return self.read_answer()
+
+    def run_pty(self, cmd):
+        """Returns the exit code, or None when the user cancelled a prompt."""
+        master, slave = pty.openpty()
+        proc = subprocess.Popen(cmd, stdin=slave, stdout=slave, stderr=slave, start_new_session=True,
+                                env=dict(os.environ, LC_ALL="C"))
+        self.child = proc
+        os.close(slave)
+        buf = ""
+        try:
+            while True:
+                ready, _, _ = select.select([master], [], [], 0.35)
+                if ready:
+                    try:
+                        chunk = os.read(master, 65536)
+                    except OSError:
+                        chunk = b""
+                    if not chunk:
+                        break
+                    buf += ANSI.sub("", chunk.decode(errors="replace")).replace("\r", "")
+                    while "\n" in buf:
+                        line, buf = buf.split("\n", 1)
+                        self.line(line.strip())
+                elif buf.strip() and proc.poll() is None:
+                    label, buf = buf.strip(), ""
+                    answer = self.on_prompt(label, master)
+                    if answer is None:
+                        self.abort()
+                        return None
+                    self.last_answer = answer
+                    os.write(master, (answer + "\n").encode())
+                elif proc.poll() is not None:
+                    break
+        finally:
+            proc.wait()
+            os.close(master)
+        return proc.returncode
+
+    def line(self, text):
+        if not text:
+            return
+        if self.last_answer is not None and (text == self.last_answer or re.fullmatch(r"\*+", text)):
+            self.last_answer = None
+            return
+        self.last_answer = None
+        self.on_line(text)
+
+    def abort(self):
+        child = self.child
         if child and child.poll() is None:
             try:
                 os.killpg(child.pid, signal.SIGTERM)
             except OSError:
                 pass
+
+    def store_password(self, name):
+        if not self.new_password:
+            return
+        password, remember = self.new_password
+        self.new_password = None
+        if remember and password:
+            self.conn_state["rememberPassword"] = keyring_set(self.uuid, name, password)
+        elif not remember:
+            keyring_clear(self.uuid)
+            self.conn_state["rememberPassword"] = False
+
+    def succeeded(self):
+        self.conn_state["lastUsed"] = int(time.time())
+        save_state(self.state)
+        emit("state", state="connected")
+        return True
+
+
+class NMOpenVPNLogin(PtyLogin):
+    """OpenVPN through NetworkManager (username / password, certificates, and
+    dynamic challenges such as OTP codes). `nmcli --ask` is the secret agent;
+    its prompts look like `Password (vpn.secrets.password): `."""
+
+    def __init__(self, uuid):
+        super().__init__(uuid)
+        self.data = vpn_data(uuid)
+        self.name = nmcli("-g", "connection.id", "connection", "show", uuid).stdout.strip() or uuid
+        self.rejected = False
+        self.autofilled = False
+
+    def on_line(self, text):
+        if text.startswith(("You need to authenticate", "Connection successfully activated", "Warning:")):
+            return
+        if text.startswith("A password is required"):
+            self.rejected = True   # NM asks again after the server refused the password
+            return
+        if text.startswith("Error:"):
+            self.error = text[len("Error:"):].strip()
+            return
+        self.messages.append(text)
+        emit("log", text=text)
+
+    def on_prompt(self, label, master):
+        m = re.match(r"^(.*?)\s*\(([^()]*)\)\s*:?$", label)
+        text, key = (m.group(1).strip(), m.group(2)) if m else (label.rstrip(":").strip(), "")
+        is_password = key == "vpn.secrets.password"
+        challenge = "challenge" in key
+        message = "\n".join(self.messages[-2:]) if challenge else ""
+        self.messages = []
+        rejected, self.rejected = self.rejected, False
+        if is_password:
+            if not rejected and not self.autofilled and self.conn_state.get("rememberPassword"):
+                saved = keyring_get(self.uuid)
+                if saved:
+                    self.autofilled = True
+                    emit("log", text="Using saved password")
+                    return saved
+            if rejected:
+                message = "The saved password was rejected." if self.autofilled else "Wrong password, try again."
+                self.autofilled = False
+        msg = self.ask("Code" if challenge else text, message=message, secret="echo" not in key,
+                       can_remember=is_password, remember=bool(self.conn_state.get("rememberPassword")))
+        if msg is None:
+            return None
+        answer = str(msg.get("answer", ""))
+        if is_password:
+            self.new_password = (answer, bool(msg.get("remember")))
+        return answer
+
+    def abort(self):
+        super().abort()
+        nmcli("connection", "down", self.uuid)
+
+    def run(self):
+        if self.data.get("connection-type", "") in OPENVPN_PASSWORD_TYPES and not self.data.get("username"):
+            msg = self.ask("Username", message="Sign in to %s" % self.name)
+            if not msg or not str(msg.get("answer", "")).strip():
+                return False
+            username = str(msg["answer"]).strip()
+            nmcli("connection", "modify", self.uuid, "+vpn.data", "username=%s" % username)
+        emit("state", state="authenticating")
+        rc = self.run_pty(["nmcli", "--ask", "--wait", str(SSO_TIMEOUT), "connection", "up", self.uuid])
+        if rc is None:
+            return False
+        if rc != 0:
+            # A failed activation keeps retrying in the background otherwise.
+            nmcli("connection", "down", self.uuid)
+            emit("error", text=self.error or (self.messages[-1] if self.messages else "Could not connect"))
+            return False
+        self.store_password(self.name)
+        return self.succeeded()
+
+
+class Ovpn3Login(PtyLogin):
+    """OpenVPN 3 session with web authentication (SAML / SSO). session-start
+    handles username / password / challenge prompts itself, then leaves the
+    session waiting for the browser sign-in; the URL is read from
+    `openvpn3 session-auth` and opened in the default browser."""
+
+    def __init__(self, uuid):
+        super().__init__(uuid)
+        self.path = ovpn3_path(uuid)
+        self.session_path = ""
+
+    def on_line(self, text):
+        m = re.match(r"Session path:\s*(\S+)", text)
+        if m:
+            self.session_path = m.group(1)
+            return
+        # session-start opens the sign-in page in the default browser by itself
+        # (g_app_info_launch_default_for_uri); the browser's own chatter lands here too.
+        if text.startswith(("Web based authentication required", "Session running, awaiting",
+                            "Further manage this session", "Connected", "Opening in existing browser")):
+            return
+        self.messages.append(text)
+        emit("log", text=text)
+
+    def on_prompt(self, label, master):
+        label = label.rstrip(":").strip()
+        secret = not (termios.tcgetattr(master)[3] & termios.ECHO)
+        message = "\n".join(self.messages[-2:])
+        self.messages = []
+        msg = self.ask(label, message=message, secret=secret)
+        return None if msg is None else str(msg.get("answer", ""))
+
+    def abort(self):
+        super().abort()
+        if self.session_path:
+            ovpn3_run("session-manage", "--path", self.session_path, "--disconnect")
+
+    def auth_url(self):
+        out = ovpn3_run("session-auth").stdout
+        for block in re.split(r"^-{10,}$", out, flags=re.M):
+            if re.search(r"^\s*Path:\s*%s\s*$" % re.escape(self.session_path), block, re.M):
+                m = re.search(r"^\s*Auth URL:\s*(\S+)", block, re.M)
+                if m:
+                    return m.group(1)
+        return ""
+
+    def run(self):
+        existing = ovpn3_sessions().get(self.path)
+        if existing and existing[1] == OVPN3_CONNECTED:
+            return self.succeeded()
+        if existing:
+            ovpn3_run("session-manage", "--path", existing[0], "--disconnect")   # stale, half-open
+        emit("state", state="authenticating")
+        rc = self.run_pty(["openvpn3", "session-start", "--config-path", self.path])
+        if rc is None:
+            return False
+        if not self.session_path:
+            emit("error", text=self.messages[-1] if self.messages else "OpenVPN 3 could not start a session")
+            return False
+        announced = ""
+        deadline = time.time() + SSO_TIMEOUT
+        while time.time() < deadline:
+            session = ovpn3_sessions().get(self.path)
+            if not session:
+                emit("error", text=self.messages[-1] if self.messages else "The VPN session ended")
+                return False
+            if session[1] == OVPN3_CONNECTED:
+                return self.succeeded()
+            url = self.auth_url()
+            if url and url != announced:
+                # The panel offers to open it again in case no browser came up.
+                announced = url
+                emit("state", state="browser", url=url)
+            time.sleep(1)
+        self.abort()
+        emit("error", text="Timed out waiting for the browser sign-in")
+        return False
+
+
+def cmd_pick_file():
+    """Native file dialog (xdg-desktop-portal FileChooser) for an OpenVPN profile."""
+    from gi.repository import Gio, GLib
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+    token = "omarchy_vpn_%d" % os.getpid()
+    handle = "/org/freedesktop/portal/desktop/request/%s/%s" % (bus.get_unique_name()[1:].replace(".", "_"), token)
+    loop = GLib.MainLoop()
+    result = {}
+
+    def on_response(conn, sender, path, iface, name, params):
+        code, results = params.unpack()
+        if code == 0 and results.get("uris"):
+            result["path"] = Gio.File.new_for_uri(results["uris"][0]).get_path()
+        loop.quit()
+
+    bus.signal_subscribe("org.freedesktop.portal.Desktop", "org.freedesktop.portal.Request", "Response", handle,
+                         None, Gio.DBusSignalFlags.NONE, on_response)
+    options = {
+        "handle_token": GLib.Variant("s", token),
+        "filters": GLib.Variant("a(sa(us))", [("OpenVPN profiles", [(0, "*.ovpn"), (0, "*.conf")]),
+                                              ("All files", [(0, "*")])]),
+    }
+    downloads = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOWNLOAD)
+    if downloads and os.path.isdir(downloads):
+        options["current_folder"] = GLib.Variant("ay", downloads.encode() + b"\0")
+    try:
+        bus.call_sync("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
+                      "org.freedesktop.portal.FileChooser", "OpenFile",
+                      GLib.Variant("(ssa{sv})", ("", "Choose an OpenVPN profile", options)), None, 0, -1, None)
+    except GLib.Error as e:
+        json.dump({"error": e.message}, sys.stdout)
+        return
+    GLib.timeout_add_seconds(600, loop.quit)
+    loop.run()
+    json.dump(result, sys.stdout)
+
+
+def cmd_connect(uuid):
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    if is_ovpn3(uuid):
+        session = Ovpn3Login(uuid)
+    elif nm_service(uuid) == OPENVPN_SERVICE:
+        session = NMOpenVPNLogin(uuid)
+    else:
+        session = Session(uuid)
+
+    def on_term(signum, frame):
+        # Cancel from the UI: take openconnect / gpauth / nmcli / openvpn3 down with us.
+        if isinstance(session, PtyLogin):
+            session.abort()
+        else:
+            child = session.child
+            if child and child.poll() is None:
+                try:
+                    os.killpg(child.pid, signal.SIGTERM)
+                except OSError:
+                    pass
         emit("state", state="cancelled")
         os._exit(1)
     signal.signal(signal.SIGTERM, on_term)
+
+    if isinstance(session, PtyLogin):
+        ok = session.run()
+        if not ok:
+            emit("state", state="cancelled")
+        sys.exit(0 if ok else 1)
 
     if not session.gateway:
         emit("error", text="Connection has no gateway configured")
@@ -699,6 +1221,8 @@ def main():
         cmd_save()
     elif cmd == "delete" and len(sys.argv) > 2:
         cmd_delete(sys.argv[2])
+    elif cmd == "pick-file":
+        cmd_pick_file()
     else:
         sys.exit(__doc__)
 

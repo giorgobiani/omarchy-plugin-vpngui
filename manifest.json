@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
   "id": "shota.openconnect",
-  "name": "OpenConnect VPN",
-  "version": "1.0.0",
+  "name": "VPN",
+  "version": "1.1.0",
   "author": "shota",
   "license": "MIT",
-  "description": "Connect to Cisco AnyConnect / OpenConnect VPNs from the bar, with native prompts for passwords, SMS and MFA codes.",
+  "description": "Connect to Cisco AnyConnect, GlobalProtect, FortiGate and other OpenConnect VPNs, and OpenVPN (username / password, certificates, OTP codes, and browser SSO / SAML), from the bar.",
   "kinds": [
     "bar-widget"
   ],
@@ -13,8 +13,8 @@
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "OpenConnect VPN",
-    "description": "Connect, disconnect and answer OpenConnect login prompts (password, SMS / MFA codes).",
+    "displayName": "VPN",
+    "description": "Connect, disconnect and answer VPN login prompts (password, SMS / MFA codes, browser SSO).",
     "category": "Network",
     "allowMultiple": false,
     "defaultSection": "right",

@@ -14,6 +14,10 @@ Item {
   property var prompt: null
   property string statusText: ""
   property string lastError: ""
+  // Browser sign-in page of an OpenVPN 3 SSO login, for "Open sign-in page".
+  property string authUrl: ""
+  // Which OpenVPN backends are installed: { nm: bool, openvpn3: bool }
+  property var openvpn: ({ nm: true, openvpn3: true })
 
   readonly property string helperPath: Qt.resolvedUrl("helper.py").toString().replace(/^file:\/\//, "")
   readonly property bool busy: phase !== "idle" || controlProcess.running
@@ -45,8 +49,20 @@ Item {
     activeUuid = uuid
     phase = "authenticating"
     statusText = "Contacting gateway…"
+    authUrl = ""
     connectProcess.command = ["python3", helperPath, "connect", uuid]
     connectProcess.running = true
+  }
+
+  function openAuthUrl() {
+    if (authUrl !== "") Quickshell.execDetached(["xdg-open", authUrl])
+  }
+
+  signal filePicked(string path)
+
+  // Native file dialog (xdg-desktop-portal) for an .ovpn file.
+  function pickFile() {
+    if (!pickProcess.running) pickProcess.running = true
   }
 
   function answer(text, remember) {
@@ -73,7 +89,8 @@ Item {
 
   signal saved(string uuid)
 
-  // profile: { uuid?, name, gateway, protocol, usergroup, username, password, rememberPassword }
+  // profile: { uuid?, name, gateway, protocol, usergroup, username, password, rememberPassword,
+  //            sso, splitTunnel, ovpnFile (new OpenVPN profiles only) }
   // Sent over stdin so the password never shows up in argv / ps.
   function save(profile) {
     if (saveProcess.running) return
@@ -108,7 +125,11 @@ Item {
       statusText = ""
     } else if (ev.event === "state") {
       if (ev.state === "authenticating") { phase = "authenticating"; statusText = "Contacting gateway…" }
-      else if (ev.state === "browser") { phase = "browser"; statusText = "Finish signing in in your browser…" }
+      else if (ev.state === "browser") {
+        phase = "browser"
+        statusText = "Finish signing in in your browser…"
+        if (ev.url) authUrl = ev.url
+      }
       else if (ev.state === "connecting") { phase = "connecting"; statusText = "Bringing up tunnel…" }
       else if (ev.state === "connected") statusText = ""
     } else if (ev.event === "log") {
@@ -126,6 +147,7 @@ Item {
         try {
           var parsed = JSON.parse(text)
           root.connections = parsed.connections || []
+          if (parsed.openvpn) root.openvpn = parsed.openvpn
           if (!parsed.ok && parsed.error) root.lastError = parsed.error
         } catch (e) {
           root.lastError = "Could not read VPN connections"
@@ -142,7 +164,22 @@ Item {
       root.phase = "idle"
       root.prompt = null
       root.statusText = ""
+      root.authUrl = ""
       root.refresh()
+    }
+  }
+
+  Process {
+    id: pickProcess
+    command: ["python3", root.helperPath, "pick-file"]
+    stdout: StdioCollector {
+      onStreamFinished: {
+        try {
+          var parsed = JSON.parse(text)
+          if (parsed.path) root.filePicked(parsed.path)
+          else if (parsed.error) root.lastError = "File dialog: " + parsed.error
+        } catch (e) {}
+      }
     }
   }
 
