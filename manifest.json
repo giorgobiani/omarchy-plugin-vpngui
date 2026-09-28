@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "shota.openconnect",
+  "name": "OpenConnect VPN",
+  "version": "1.0.0",
+  "author": "shota",
+  "license": "MIT",
+  "description": "Connect to Cisco AnyConnect / OpenConnect VPNs from the bar, with native prompts for passwords, SMS and MFA codes.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "OpenConnect VPN",
+    "description": "Connect, disconnect and answer OpenConnect login prompts (password, SMS / MFA codes).",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 10
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 3,
+        "max": 600,
+        "step": 1,
+        "defaultValue": 10
+      }
+    ]
+  }
+}
