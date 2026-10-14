@@ -305,6 +305,33 @@ Panel {
             wrapMode: Text.WordWrap
           }
 
+          RowLayout {
+            visible: vpn.missingPackages.length > 0
+            width: parent.width
+            spacing: Style.space(8)
+
+            Text {
+              Layout.fillWidth: true
+              text: "Missing packages: " + vpn.missingPackages.join(", ")
+              textFormat: Text.PlainText
+              color: root.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
+            }
+
+            Button {
+              text: "Install"
+              bordered: true
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: {
+                vpn.installPackages("omarchy pkg add " + vpn.missingPackages.join(" "))
+                root.close()
+              }
+            }
+          }
+
           PromptCard {
             id: promptCard
             visible: root.promptOpen
@@ -706,9 +733,22 @@ Panel {
       || (isOpenvpn && isNew)
     readonly property bool useSso: sso && (ssoCapable || isOpenvpn)
     readonly property bool isGp: protocol === "gp"
-    readonly property string missingBackend: !isOpenvpn ? ""
-      : (useSso ? (vpn.openvpn.openvpn3 ? "" : "Browser SSO for OpenVPN needs OpenVPN 3: omarchy pkg aur add openvpn3")
-                : (vpn.openvpn.nm ? "" : "OpenVPN needs NetworkManager's plugin: omarchy pkg add networkmanager-openvpn"))
+    // What the chosen protocol / sign-in still needs: { text, command, blocking }.
+    // OpenVPN profiles can't be imported without their backend; gpauth is only
+    // needed once a GlobalProtect SSO profile connects.
+    readonly property var missingDependency: {
+      if (isOpenvpn && useSso && !vpn.openvpn.openvpn3)
+        return { text: "Browser SSO for OpenVPN needs OpenVPN 3 (from the AUR).",
+                 command: "omarchy pkg aur add openvpn3", blocking: true }
+      if (isOpenvpn && !useSso && !vpn.openvpn.nm)
+        return { text: "OpenVPN needs NetworkManager's OpenVPN plugin.",
+                 command: "omarchy pkg add networkmanager-openvpn openvpn python-gobject", blocking: true }
+      if (isGp && useSso && !vpn.gpauth)
+        return { text: "Browser SSO for GlobalProtect needs gpauth.",
+                 command: "omarchy pkg add globalprotect-openconnect", blocking: false }
+      return null
+    }
+    readonly property string missingBackend: missingDependency && missingDependency.blocking ? missingDependency.text : ""
     readonly property bool valid: nameField.text.trim() !== "" && missingBackend === ""
       && (isOpenvpn ? (!isNew || fileField.text.trim() !== "") : gatewayField.text.trim() !== "")
     readonly property var protocolOptions: {
@@ -859,14 +899,31 @@ Panel {
       onChanged: function(value) { form.sso = value === "sso" }
     }
 
-    Text {
-      visible: form.missingBackend !== ""
+    RowLayout {
+      visible: form.missingDependency !== null
       width: parent.width
-      text: form.missingBackend
-      color: root.urgent
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.caption
-      wrapMode: Text.WordWrap
+      spacing: Style.space(8)
+
+      Text {
+        Layout.fillWidth: true
+        text: form.missingDependency ? form.missingDependency.text : ""
+        textFormat: Text.PlainText
+        color: root.urgent
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
+
+      Button {
+        text: "Install"
+        bordered: true
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        onClicked: {
+          vpn.installPackages(form.missingDependency.command)
+          root.close()
+        }
+      }
     }
 
     Text {

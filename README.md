@@ -70,6 +70,11 @@ omarchy plugin add https://github.com/giorgobiani/omarchy-plugin-vpngui.git --en
 terminal, it also asks which bar section the widget goes in (the default is
 right). The shield icon then shows up in the bar.
 
+If any required package is missing, the panel says which and offers an
+**Install** button that runs `omarchy pkg add` in a terminal. The optional
+packages (OpenVPN, OpenVPN 3, gpauth) get the same button in the connection
+form as soon as you pick the protocol or sign-in that needs them.
+
 To move it later:
 
 ```bash

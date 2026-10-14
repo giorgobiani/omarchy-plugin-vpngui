@@ -18,6 +18,10 @@ Item {
   property string authUrl: ""
   // Which OpenVPN backends are installed: { nm: bool, openvpn3: bool }
   property var openvpn: ({ nm: true, openvpn3: true })
+  // Whether gpauth (GlobalProtect browser SSO) is installed.
+  property bool gpauth: true
+  // Required packages pacman doesn't have yet; the panel offers to install them.
+  property var missingPackages: []
 
   readonly property string helperPath: Qt.resolvedUrl("helper.py").toString().replace(/^file:\/\//, "")
   readonly property bool busy: phase !== "idle" || controlProcess.running
@@ -38,6 +42,12 @@ Item {
   property string settlingUuid: ""
   property bool settleOnRefresh: false
   readonly property int refreshIntervalSec: Math.max(3, parseInt(settings && settings.refreshIntervalSec) || 10)
+
+  // Runs an `omarchy pkg ...` command in Omarchy's floating terminal, where
+  // sudo can ask for the password. The panel picks up the result on its next refresh.
+  function installPackages(command) {
+    Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", command])
+  }
 
   function refresh() {
     if (listProcess.running) return
@@ -204,6 +214,8 @@ Item {
             root.disconnecting = ({})
           }
           if (parsed.openvpn) root.openvpn = parsed.openvpn
+          root.gpauth = parsed.gpauth !== false
+          root.missingPackages = parsed.missing || []
           if (!parsed.ok && parsed.error) root.lastError = parsed.error
         } catch (e) {
           root.lastError = "Could not read VPN connections"

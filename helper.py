@@ -45,6 +45,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
                          "omarchy", "plugins", "shota.openconnect")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
+# Needed for every OpenConnect profile; the panel offers to install whatever is missing.
+REQUIRED_PACKAGES = ("networkmanager-openconnect", "openconnect", "libsecret", "gnome-keyring")
 
 NOISE = re.compile(
     r"^(POST|GET) https?://|^Connected to |^SSL negotiation|^Connected to HTTPS|^XML POST enabled|"
@@ -184,8 +186,19 @@ def cmd_list():
         conns.append(entry)
     conns += ovpn3_profiles(state)
     json.dump({"ok": res.returncode == 0, "error": res.stderr.strip(), "connections": conns,
+               "missing": missing_packages(REQUIRED_PACKAGES),
                "openvpn": {"nm": os.path.exists("/usr/lib/NetworkManager/VPN/nm-openvpn-service.name"),
-                           "openvpn3": bool(shutil.which("openvpn3"))}}, sys.stdout)
+                           "openvpn3": bool(shutil.which("openvpn3"))},
+               "gpauth": bool(shutil.which("gpauth"))}, sys.stdout)
+
+
+def missing_packages(packages):
+    """The packages pacman doesn't have installed (`pacman -T` prints exactly those)."""
+    try:
+        res = subprocess.run(["pacman", "-T", *packages], capture_output=True, text=True)
+    except OSError:
+        return []
+    return res.stdout.split() if res.returncode == 127 else []
 
 
 def openvpn_remote(remote):
