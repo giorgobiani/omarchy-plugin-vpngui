@@ -265,7 +265,14 @@ uses this to bring a VPN up before it opens a Remote Desktop session.
    certificate trust) goes to the panel as a JSON event, and your answer goes
    back over stdin.
 2. Browser SSO:
-   - **AnyConnect**: `openconnect --external-browser xdg-open`
+   - **AnyConnect**: `openconnect --external-browser xdg-open`. Some Cisco
+     gateways offer SAML only in an embedded browser, and openconnect then
+     reports `No SSO handler`. In that case the helper opens NetworkManager's
+     own sign-in window (`nm-openconnect-auth-dialog`, which has a built-in
+     WebKit browser) and takes the session cookie from it. These gateways
+     return an empty reply unless the user-agent starts with "AnyConnect", so
+     the helper sets `useragent=AnyConnect Linux_64 4.10.07061` on the
+     connection if it has none.
    - **GlobalProtect**: `gpauth --browser default`
    - **Fortinet**: your default browser signs in, FortiGate redirects to
      `http://127.0.0.1:8020/?id=…`, and that id is exchanged for the
@@ -324,6 +331,14 @@ Read the code before you enable it.
   that connection.
 - **"Remember password" doesn't stick**: a Secret Service keyring has to be
   running and unlocked (`gnome-keyring` on Omarchy).
+- **AnyConnect SSO opens a "Connect to VPN" window instead of your browser**:
+  the gateway only allows sign-in in an embedded browser. Click **Login** in
+  that window and sign in there. To use your normal browser instead, the VPN
+  admin has to turn on external-browser SAML for the tunnel group
+  (`saml external-browser` on ASA 9.17+ / FTD 7.1+).
+- **AnyConnect: "Unexpected empty response body from server"**: the gateway
+  rejects the client's user-agent. Set one that starts with "AnyConnect":
+  `nmcli connection modify <name> +vpn.data "useragent=AnyConnect Linux_64 4.10.07061"`.
 - **GlobalProtect SSO**: `omarchy pkg add globalprotect-openconnect`.
 - **OpenVPN: "Choose the .ovpn file …"**: the path is wrong or empty. `~` is
   fine.
