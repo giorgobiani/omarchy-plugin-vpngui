@@ -92,6 +92,12 @@ KEYRING_SERVICE = "omarchy-openconnect"
 PROTOCOLS = ("anyconnect", "gp", "nc", "pulse", "f5", "fortinet", "array")
 OPENCONNECT_SERVICE = "org.freedesktop.NetworkManager.openconnect"
 OPENVPN_SERVICE = "org.freedesktop.NetworkManager.openvpn"
+# NetworkManager's OpenConnect sign-in window. It has a built-in WebKit browser,
+# which AnyConnect gateways need when they only offer embedded-browser SAML.
+NM_OPENCONNECT_AUTH_DIALOG = "/usr/lib/nm-openconnect-auth-dialog"
+# Cisco gateways answer the sign-in window with an empty reply unless the
+# user-agent starts with "AnyConnect".
+EMBEDDED_SSO_USERAGENT = "AnyConnect Linux_64 4.10.07061"
 OVPN3_PREFIX = "ovpn3:"
 OVPN3_CONFIG_ROOT = "/net/openvpn/v3/configuration/"
 # NM-OpenVPN connection types that take a username / password.
@@ -517,6 +523,7 @@ class Session:
         self.protocol = self.data.get("protocol") or "anyconnect"
         self.sso = bool(self.conn_state.get("sso")) and self.protocol in SSO_PROTOCOLS
         self.saml_required = False
+        self.embedded_sso = False  # gateway offers only embedded-browser SAML
         self.child = None
         self.redact = ""  # secret typed via --passwd-on-stdin; never logged
 
@@ -571,6 +578,8 @@ class Session:
             self.pending_pin = m.group(0)
         if re.search(r"SAML .*authentication (is )?required|SAML REDIRECT|No SSO handler", line):
             self.saml_required = True
+        if "No SSO handler" in line:
+            self.embedded_sso = True
         if not line.strip() or NOISE.search(line):
             return
         self.messages.append(line.strip())
@@ -705,6 +714,8 @@ class Session:
             if self.saml_required and not self.sso:
                 emit("error", text="This server uses browser single sign-on. Edit the connection and set Sign-in to Browser SSO.")
                 return None
+            if self.embedded_sso and self.sso:
+                return None  # run_login falls back to NetworkManager's sign-in window
             tail = [m for m in self.messages if m] or ["Authentication failed"]
             emit("error", text=tail[-1])
             return None
@@ -725,12 +736,62 @@ class Session:
             return self.authenticate()
         if self.protocol == "anyconnect":
             emit("state", state="browser")
-            return self.authenticate(extra=("--external-browser", "xdg-open"))
+            auth = self.authenticate(extra=("--external-browser", "xdg-open"))
+            if auth is None and self.embedded_sso:
+                return self.nm_dialog_sso()
+            return auth
         if self.protocol == "gp":
             return self.gp_sso()
         if self.protocol == "fortinet":
             return self.fortinet_sso()
         return self.authenticate()
+
+    def nm_dialog_sso(self):
+        """Sign in through NetworkManager's OpenConnect window.
+
+        Some AnyConnect gateways offer SAML only in an embedded browser, which the
+        openconnect command line doesn't have. nm-openconnect-auth-dialog does. It
+        reads the connection's vpn.data on stdin and prints the session secrets as
+        key / value lines, ending with a blank line.
+        """
+        if not os.access(NM_OPENCONNECT_AUTH_DIALOG, os.X_OK):
+            emit("error", text="This gateway needs NetworkManager's sign-in window. Install networkmanager-openconnect.")
+            return None
+        if not self.data.get("useragent"):
+            # The tunnel itself also needs the AnyConnect user-agent, so store it on the connection.
+            self.data["useragent"] = EMBEDDED_SSO_USERAGENT
+            nmcli("connection", "modify", self.uuid, "+vpn.data", "useragent=" + EMBEDDED_SSO_USERAGENT)
+        name = nmcli("-g", "connection.id", "connection", "show", self.uuid).stdout.strip() or self.gateway
+        emit("log", text="This gateway signs in through its own window. Finish signing in there.")
+        emit("state", state="browser")
+        proc = subprocess.Popen(
+            [NM_OPENCONNECT_AUTH_DIALOG, "-u", self.uuid, "-n", name, "-s", OPENCONNECT_SERVICE, "-i"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            start_new_session=True, text=True)
+        self.child = proc
+        details = "".join("DATA_KEY=%s\nDATA_VAL=%s\n\n" % kv for kv in self.data.items())
+        proc.stdin.write(details + "DONE\n\n")
+        proc.stdin.flush()
+        secrets = {}
+        while True:
+            key = proc.stdout.readline()
+            if not key or not key.strip():
+                break
+            secrets[key.strip()] = proc.stdout.readline().rstrip("\n")
+        try:
+            proc.stdin.write("QUIT\n\n")
+            proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        if not secrets.get("cookie"):
+            emit("error", text="Sign-in window closed before signing in")
+            return None
+        return {"COOKIE": secrets["cookie"], "HOST": secrets.get("gateway") or self.gateway,
+                "FINGERPRINT": secrets.get("gwcert", ""), "RESOLVE": secrets.get("resolve", "")}
 
     def gp_sso(self):
         """GlobalProtect SAML via gpauth (globalprotect-openconnect) in the default browser."""
